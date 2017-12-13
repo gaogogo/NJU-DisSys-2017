@@ -20,7 +20,6 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
-	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -50,9 +49,9 @@ type ApplyMsg struct {
 
 // log entry
 type LogEntrie struct {
-	term    int
-	index   int
-	command interface{}
+	Term    int
+	Index   int
+	Command interface{}
 }
 
 //
@@ -99,7 +98,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 //
 func (rf *Raft) LastLogInfo() (int, int) {
-	return rf.log[len(rf.log)-1].index, rf.log[len(rf.log)-1].term
+	return rf.log[len(rf.log)-1].Index, rf.log[len(rf.log)-1].Term
 }
 
 //
@@ -177,9 +176,13 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 	lastLogIndex, lastLogTerm := rf.LastLogInfo()
 
-	argsNew := true
-	if args.LastLogIndex < lastLogIndex || args.LastLogTerm < lastLogTerm {
-		argsNew = false
+	argsNew := false
+	if args.LastLogTerm > lastLogTerm {
+		argsNew = true
+	}
+
+	if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
+		argsNew = true
 	}
 
 	if (rf.votedFor == NULL || rf.votedFor == args.CandidateId) && argsNew {
@@ -274,8 +277,8 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []LogEntrie
 	LeaderCommit int
+	Entries      []LogEntrie
 }
 
 //
@@ -290,7 +293,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	defer rf.mu.Unlock()
 	defer rf.persist()
 
-	fmt.Printf("AppendEntries args.Term : %d \n", args.Term)
+	//fmt.Printf("AppendEntries args.Term : %d\n", args.Term)
 	reply.Success = false
 	if args.Term < rf.currenTerm {
 		reply.Term = rf.currenTerm
@@ -311,10 +314,10 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 
-	base := rf.log[0].index
+	base := rf.log[0].Index
 	if args.PrevLogIndex >= base {
 
-		if args.PrevLogTerm != rf.log[args.PrevLogIndex-base].term {
+		if args.PrevLogTerm != rf.log[args.PrevLogIndex-base].Term {
 			return
 		}
 
@@ -338,15 +341,18 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 //
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	//fmt.Printf("args.Term : %d\n", args.Term)
 
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	//fmt.Printf("re args.Term : %d\n", args.Term)
 	rf.mu.Lock()
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 	if ok {
 		if rf.serverState != LEADER || args.Term != rf.currenTerm {
 			return ok
 		}
 		if reply.Term > rf.currenTerm {
+			//log.Printf("server : %d 's term(%d) bigger than me(%d)'\n", server, reply.Term, rf.me)
 			rf.currenTerm = reply.Term
 			rf.serverState = FOLLOWER
 			rf.votedFor = NULL
@@ -355,7 +361,7 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 		}
 		if reply.Success {
 			if len(args.Entries) > 0 {
-				rf.nextIndex[server] = args.Entries[len(args.Entries)-1].index + 1
+				rf.nextIndex[server] = args.Entries[len(args.Entries)-1].Index + 1
 				rf.matchIndex[server] = rf.nextIndex[server] - 1
 			}
 		} else {
@@ -372,18 +378,14 @@ func (rf *Raft) brodcastAppendEntries() {
 	defer rf.mu.Unlock()
 
 	lastLogIndex, _ := rf.LastLogInfo()
-	base := rf.log[0].index
+	base := rf.log[0].Index
 
 	N := rf.commitIndex
 	for i := rf.commitIndex + 1; i <= lastLogIndex; i++ {
 
-		if rf.log[i-base].term != rf.currenTerm {
-			continue
-		}
-
 		count := 1
 		for s := range rf.peers {
-			if s != rf.me && rf.matchIndex[s] >= i {
+			if s != rf.me && rf.matchIndex[s] >= i && rf.log[i-base].Term == rf.currenTerm {
 				count++
 			}
 		}
@@ -405,7 +407,7 @@ func (rf *Raft) brodcastAppendEntries() {
 
 			args.PrevLogIndex = rf.nextIndex[i] - 1
 			//fmt.Printf("args.PrevLogIndex : %d base : %d i:%d\n ", args.PrevLogIndex, base, i)
-			args.PrevLogTerm = rf.log[args.PrevLogIndex-base].term
+			args.PrevLogTerm = rf.log[args.PrevLogIndex-base].Term
 			args.Entries = make([]LogEntrie, len(rf.log[args.PrevLogIndex+1-base:]))
 			copy(args.Entries, rf.log[args.PrevLogIndex+1-base:])
 			args.LeaderCommit = rf.commitIndex
@@ -443,7 +445,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		lastLogIndex, _ := rf.LastLogInfo()
 		index = lastLogIndex + 1
-		rf.log = append(rf.log, LogEntrie{term: term, index: index, command: command})
+		rf.log = append(rf.log, LogEntrie{Term: term, Index: index, Command: command})
 		rf.persist()
 	}
 
@@ -462,6 +464,7 @@ func (rf *Raft) Kill() {
 
 //
 func (rf *Raft) followerHandle() {
+	//log.Printf("I am followerin total %d nodes, my id is %d \n", len(rf.peers), rf.me)
 	select {
 	case <-rf.chanHeartbeat:
 	case <-rf.chanGrantVote:
@@ -472,6 +475,7 @@ func (rf *Raft) followerHandle() {
 
 //
 func (rf *Raft) candidateHandle() {
+	//log.Printf("I am candidatein total %d nodes, my id is %d \n", len(rf.peers), rf.me)
 	go rf.brodcastRequestVote()
 	select {
 	case <-rf.chanHeartbeat:
@@ -488,6 +492,7 @@ func (rf *Raft) candidateHandle() {
 			//fmt.Printf("rf.nextIndex[%d] : %d\n", i, rf.nextIndex[i])
 			rf.matchIndex[i] = 0
 		}
+
 		rf.mu.Unlock()
 	case <-time.After(time.Duration(rand.Int63()%150+200) * time.Millisecond):
 	}
@@ -495,6 +500,7 @@ func (rf *Raft) candidateHandle() {
 
 //
 func (rf *Raft) leaderHandle() {
+	//log.Printf("I am leader in total %d nodes, my id is %d \n", len(rf.peers), rf.me)
 	rf.brodcastAppendEntries()
 	time.Sleep(TIMER_HEARTBEAT)
 }
@@ -520,9 +526,9 @@ func (rf *Raft) AppliedMsg(applyCh chan ApplyMsg) {
 		select {
 		case <-rf.chanCommit:
 			rf.mu.Lock()
-			base := rf.log[0].index
+			base := rf.log[0].Index
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-				msg := ApplyMsg{Index: i, Command: rf.log[i-base].command}
+				msg := ApplyMsg{Index: i, Command: rf.log[i-base].Command}
 				applyCh <- msg
 				rf.lastApplied = i
 			}
@@ -553,7 +559,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.serverState = FOLLOWER
 	rf.currenTerm = 0
 	rf.votedFor = NULL
-	rf.log = append(rf.log, LogEntrie{term: 0})
+	rf.log = append(rf.log, LogEntrie{Term: 0})
 
 	rf.chanGrantVote = make(chan bool, 50)
 	rf.chanHeartbeat = make(chan bool, 50)
